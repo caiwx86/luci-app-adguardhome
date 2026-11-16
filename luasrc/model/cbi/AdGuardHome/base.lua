@@ -87,8 +87,10 @@ o.rmempty = false
 
 local port = read_dns_port(configpath) or "?"
 
-o = s:option(ListValue, "redirect", "重定向模式",
-	"AdGuard Home DNS 端口：" .. port .. " / " .. firewall_backend)
+o = s:option(ListValue, "redirect", "重定向模式")
+o.template = "AdGuardHome/redirect_mode"
+o.backend = firewall_backend
+o.agh_port = port
 o:value("none", translate("不启用"))
 o:value("dnsmasq-upstream", translate("作为 dnsmasq 上游服务器"))
 o:value("redirect", translate("将 53 端口劫持到 AdGuardHome"))
