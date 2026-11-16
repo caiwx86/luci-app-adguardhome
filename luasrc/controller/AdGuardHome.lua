@@ -269,6 +269,7 @@ function check_update()
 	if fs.access("/var/run/update_core") then
 		http.write(content)
 	else
-		http.write(content .. "\0")
+		-- Plain-text end marker: a NUL byte here made the template binary.
+		http.write(content .. "\n__AGH_UPDATE_FINISHED__\n")
 	end
 end
