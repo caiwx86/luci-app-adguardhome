@@ -13,6 +13,7 @@ extra_command "testbackup" "backup or restore"
 extra_command "test_crontab"
 extra_command "force_reload"
 extra_command "isrunning"
+extra_command "repair" "detect and repair common service issues"
 
 set_forward_dnsmasq()
 {
@@ -247,6 +248,129 @@ _isrunning(){
 	# 用进程名匹配，避免 pgrep -f 自匹配
 	pgrep "${binpath##*/}" >/dev/null 2>&1 && return 0
 	return 1
+}
+
+managed_pids()
+{
+	local data
+	command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1 || return 1
+	data="$(ubus call service list '{"name":"AdGuardHome"}' 2>/dev/null)" || return 1
+	printf '%s' "$data" | jsonfilter -e '@.AdGuardHome.instances.*.pid' 2>/dev/null | tr '\n' ' '
+}
+
+kill_orphan_instances()
+{
+	local managed binname pid found=0
+
+	if ! managed="$(managed_pids)"; then
+		logger -t AdGuardHome "cannot query procd; skipping orphan cleanup"
+		return 0
+	fi
+	managed=" $managed "
+	config_get binpath "$CONFIGURATION" binpath "/usr/bin/AdGuardHome"
+	binname="${binpath##*/}"
+	[ -n "$binname" ] || return 0
+
+	for pid in $(pgrep "$binname" 2>/dev/null); do
+		case "$managed" in
+		*" $pid "*) ;;
+		*)
+			found=1
+			logger -t AdGuardHome "stopping orphan process $pid"
+			kill -TERM "$pid" 2>/dev/null
+			;;
+		esac
+	done
+	[ "$found" = "1" ] || return 0
+
+	sleep 1
+	for pid in $(pgrep "$binname" 2>/dev/null); do
+		case "$managed" in
+		*" $pid "*) ;;
+		*) kill -KILL "$pid" 2>/dev/null ;;
+		esac
+	done
+}
+
+repair_service()
+{
+	local enabled binpath configpath redirect
+	local managed binname pid killed=0 changed=0
+
+	config_load "$CONFIGURATION"
+	config_get_bool enabled $CONFIGURATION enabled 0
+	config_get binpath $CONFIGURATION binpath "/usr/bin/AdGuardHome"
+	config_get configpath $CONFIGURATION configpath "/etc/AdGuardHome.yaml"
+	config_get redirect $CONFIGURATION redirect "none"
+	binname="${binpath##*/}"
+
+	# A stale stop flag prevents start_service from working.
+	if [ "$enabled" = "1" ] && [ -f /var/run/AdGserverdis ]; then
+		rm -f /var/run/AdGserverdis
+		echo "cleared stale stop flag"
+		changed=1
+	fi
+	rm -f /var/run/AdGlucitest 2>/dev/null
+
+	# AdGuard Home refuses to start without a usable configuration.
+	if [ ! -s "$configpath" ] && [ -s /usr/share/AdGuardHome/AdGuardHome_template.yaml ]; then
+		cp -f /usr/share/AdGuardHome/AdGuardHome_template.yaml "$configpath"
+		echo "restored missing configuration: $configpath"
+		changed=1
+	fi
+
+	# Processes started outside procd keep the ports busy and make the
+	# service look started while it is not supervised.
+	if managed="$(managed_pids)"; then
+		managed=" $managed "
+		for pid in $(pgrep "$binname" 2>/dev/null); do
+			case "$managed" in
+			*" $pid "*) ;;
+			*)
+				killed=1
+				logger -t AdGuardHome "repair: stopping orphan process $pid"
+				kill -TERM "$pid" 2>/dev/null
+				;;
+			esac
+		done
+	fi
+	if [ "$killed" = "1" ]; then
+		sleep 1
+		for pid in $(pgrep "$binname" 2>/dev/null); do
+			case "$managed" in
+			*" $pid "*) ;;
+			*) kill -KILL "$pid" 2>/dev/null ;;
+			esac
+		done
+		echo "stopped orphan process(es)"
+		changed=1
+	fi
+
+	if [ "$enabled" = "1" ]; then
+		if [ ! -x "$binpath" ]; then
+			echo "binary is missing: $binpath"
+			return 1
+		fi
+		if _isrunning; then
+			echo "service is running"
+		else
+			echo "starting service"
+			start
+			changed=1
+		fi
+		if [ "$redirect" != "none" ] && _isrunning; then
+			_do_redirect 1
+		fi
+	else
+		if _isrunning; then
+			echo "service is disabled but running; stopping it"
+			stop
+			changed=1
+		fi
+	fi
+
+	[ "$changed" = "1" ] && echo "repair finished" || echo "nothing to repair"
+	return 0
 }
 
 force_reload(){
@@ -546,6 +670,9 @@ start_service() {
 	rm -f /var/run/AdGserverdis >/dev/null 2>&1
 	config_load "${CONFIGURATION}"
 
+	# Processes started outside procd would keep the DNS/web port busy.
+	kill_orphan_instances
+
 	config_get hashpass $CONFIGURATION hashpass ""
 	config_get configpath $CONFIGURATION configpath "/etc/AdGuardHome.yaml"
 
@@ -753,6 +880,23 @@ stop_service()
 
 	echo "AdGuardHome service disabled"
 	touch /var/run/AdGserverdis
+
+	# Belt and braces: if procd cannot terminate a stuck daemon, kill it
+	# after a grace period so the DNS port is released.
+	local binname oldpids
+	config_get binpath $CONFIGURATION binpath "/usr/bin/AdGuardHome"
+	binname="${binpath##*/}"
+	oldpids="$(pgrep "$binname" 2>/dev/null)"
+	if [ -n "$binname" ] && [ -n "$oldpids" ]; then
+		(
+			sleep 8
+			[ -f /var/run/AdGserverdis ] || exit 0
+			for pid in $oldpids; do
+				logger -t AdGuardHome "force-killing stuck process $pid"
+				kill -KILL "$pid" 2>/dev/null
+			done
+		) &
+	fi
 }
 
 boot() {
