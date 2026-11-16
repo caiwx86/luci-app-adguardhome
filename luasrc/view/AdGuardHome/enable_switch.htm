@@ -118,7 +118,7 @@
 				if (!repaired) {
 					if (status)
 						status.innerHTML = '正在自动修复…';
-					XHR.get('<%=url([[admin]], [[services]], [[AdGuardHome]], [[repair]])%>', null, function() {
+					XHR.get('<%=url([[admin]], [[services]], [[AdGuardHome]], [[repair]])%>?auto=1', null, function() {
 						if (serial !== pollSerial)
 							return;
 						pollTarget(target, serial, 10, true);

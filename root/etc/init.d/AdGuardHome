@@ -258,44 +258,10 @@ managed_pids()
 	printf '%s' "$data" | jsonfilter -e '@.AdGuardHome.instances.*.pid' 2>/dev/null | tr '\n' ' '
 }
 
-kill_orphan_instances()
-{
-	local managed binname pid found=0
-
-	if ! managed="$(managed_pids)"; then
-		logger -t AdGuardHome "cannot query procd; skipping orphan cleanup"
-		return 0
-	fi
-	managed=" $managed "
-	config_get binpath "$CONFIGURATION" binpath "/usr/bin/AdGuardHome"
-	binname="${binpath##*/}"
-	[ -n "$binname" ] || return 0
-
-	for pid in $(pgrep "$binname" 2>/dev/null); do
-		case "$managed" in
-		*" $pid "*) ;;
-		*)
-			found=1
-			logger -t AdGuardHome "stopping orphan process $pid"
-			kill -TERM "$pid" 2>/dev/null
-			;;
-		esac
-	done
-	[ "$found" = "1" ] || return 0
-
-	sleep 1
-	for pid in $(pgrep "$binname" 2>/dev/null); do
-		case "$managed" in
-		*" $pid "*) ;;
-		*) kill -KILL "$pid" 2>/dev/null ;;
-		esac
-	done
-}
-
 repair_service()
 {
 	local enabled binpath configpath redirect
-	local managed binname pid killed=0 changed=0
+	local managed binname pid changed=0
 
 	config_load "$CONFIGURATION"
 	config_get_bool enabled $CONFIGURATION enabled 0
@@ -303,6 +269,22 @@ repair_service()
 	config_get configpath $CONFIGURATION configpath "/etc/AdGuardHome.yaml"
 	config_get redirect $CONFIGURATION redirect "none"
 	binname="${binpath##*/}"
+
+	# Throttle *automatic* repairs only: the UI retries after a failed toggle
+	# and repeated start/stop cycles make a slow start worse.  A manual repair
+	# (button or command line) is always executed.
+	if [ "$1" = "auto" ]; then
+		local now last
+		now="$(date +%s 2>/dev/null)"
+		last="$(cat /var/run/AdGlastrepair 2>/dev/null)"
+		case "$now" in ''|*[!0-9]*) now=0 ;; esac
+		case "$last" in ''|*[!0-9]*) last=0 ;; esac
+		if [ "$now" -gt 0 ] && [ "$last" -gt 0 ] && [ $((now - last)) -lt 30 ]; then
+			echo "repair skipped (cooldown)"
+			return 0
+		fi
+		[ "$now" -gt 0 ] && echo "$now" > /var/run/AdGlastrepair
+	fi
 
 	# A stale stop flag prevents start_service from working.
 	if [ "$enabled" = "1" ] && [ -f /var/run/AdGserverdis ]; then
@@ -319,30 +301,37 @@ repair_service()
 		changed=1
 	fi
 
-	# Processes started outside procd keep the ports busy and make the
-	# service look started while it is not supervised.
+	# Report processes that are not supervised by procd, but do not kill them
+	# automatically.  On a busy router the current instance may not be visible
+	# through ubus yet, and killing a legitimate process leads to a restart
+	# storm (and keeps the web UI busy while nginx is already struggling).
+	local unmanaged=""
 	if managed="$(managed_pids)"; then
 		managed=" $managed "
 		for pid in $(pgrep "$binname" 2>/dev/null); do
 			case "$managed" in
 			*" $pid "*) ;;
-			*)
-				killed=1
-				logger -t AdGuardHome "repair: stopping orphan process $pid"
-				kill -TERM "$pid" 2>/dev/null
-				;;
+			*) unmanaged="$unmanaged $pid" ;;
 			esac
 		done
 	fi
-	if [ "$killed" = "1" ]; then
-		sleep 1
-		for pid in $(pgrep "$binname" 2>/dev/null); do
-			case "$managed" in
-			*" $pid "*) ;;
-			*) kill -KILL "$pid" 2>/dev/null ;;
-			esac
+	if [ -n "$unmanaged" ]; then
+		echo "unmanaged AdGuardHome process(es):$unmanaged (left untouched)"
+		logger -t AdGuardHome "repair: unmanaged process(es):$unmanaged"
+	fi
+
+	# Killing is only done when the administrator explicitly asks for it
+	# with 'repair force'; automatic repairs must never fight procd.
+	if [ "$1" = "force" ] && [ -n "$unmanaged" ]; then
+		for pid in $unmanaged; do
+			logger -t AdGuardHome "repair: force-killing process $pid"
+			kill -TERM "$pid" 2>/dev/null
 		done
-		echo "stopped orphan process(es)"
+		sleep 1
+		for pid in $unmanaged; do
+			kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null
+		done
+		echo "force-stopped unmanaged process(es):$unmanaged"
 		changed=1
 	fi
 
@@ -670,9 +659,6 @@ start_service() {
 	rm -f /var/run/AdGserverdis >/dev/null 2>&1
 	config_load "${CONFIGURATION}"
 
-	# Processes started outside procd would keep the DNS/web port busy.
-	kill_orphan_instances
-
 	config_get hashpass $CONFIGURATION hashpass ""
 	config_get configpath $CONFIGURATION configpath "/etc/AdGuardHome.yaml"
 
@@ -891,6 +877,8 @@ stop_service()
 		(
 			sleep 8
 			[ -f /var/run/AdGserverdis ] || exit 0
+			# Do not kill anything if the service was re-enabled meanwhile.
+			[ "$(uci -q get AdGuardHome.AdGuardHome.enabled)" = "1" ] && exit 0
 			for pid in $oldpids; do
 				logger -t AdGuardHome "force-killing stuck process $pid"
 				kill -KILL "$pid" 2>/dev/null

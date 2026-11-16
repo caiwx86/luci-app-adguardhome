@@ -109,12 +109,13 @@ function act_status()
 end
 
 function do_repair()
-	local output = luci.sys.exec("/etc/init.d/AdGuardHome repair 2>&1")
+	local auto = http.formvalue("auto") == "1" and " auto" or ""
+	local output = luci.sys.exec("/etc/init.d/AdGuardHome repair" .. auto .. " 2>&1")
 	local enabled = uci:get("AdGuardHome", "AdGuardHome", "enabled") == "1"
 	local running = service_running()
 	-- Starting procd instances is asynchronous; give them a moment before
 	-- reporting the result to the page.
-	for _ = 1, 5 do
+	for _ = 1, 3 do
 		if running or not enabled then break end
 		luci.sys.call("sleep 1")
 		running = service_running()
