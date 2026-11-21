@@ -662,6 +662,7 @@ use_port53()
 	[ -z "$old_dns" ] && old_dns="53"
 
 	if [ "$old_agh" = "53" ]; then
+		new_dns=""
 		if [ "$old_dns" = "53" ]; then
 			new_dns="$(find_free_port 1745)" || return 1
 			free_port_force "$new_dns" "exchange" || return 1
@@ -669,6 +670,26 @@ use_port53()
 			ADG_NEW_PORT="$new_dns"
 		else
 			ADG_NEW_PORT="$old_dns"
+		fi
+
+		if ! port_has_agh 53; then
+			if ! port_free 53; then
+				if ! free_port_force 53 "exchange"; then
+					if [ -n "$new_dns" ]; then
+						restart_dnsmasq_on 53 "$new_dns"
+					fi
+					return 1
+				fi
+			fi
+			if ! wait_agh_on 53 15; then
+				logger -t AdGuardHome "exchange: AdGuardHome is not listening on 53"
+				if [ -n "$new_dns" ]; then
+					restart_dnsmasq_on 53 "$new_dns"
+				else
+					restart_dnsmasq_on 53 "$old_dns"
+				fi
+				return 1
+			fi
 		fi
 		return 0
 	fi
