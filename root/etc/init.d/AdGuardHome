@@ -1175,6 +1175,32 @@ start_service() {
 	config_get memlimit $CONFIGURATION memlimit "0"
 	config_get_bool jail $CONFIGURATION jail 0
 
+	# Make sure the configured DNS port is not held by a stale/foreign
+	# process. dnsmasq is moved by the mode switch, not killed here, so a
+	# partial exchange state does not lose DHCP/DNS.
+	local agh_port occupant=0 pid pname curr_dns
+	if [ -n "$configpath" ]; then
+		agh_port="$(config_editor "dns.port" "" "$configpath" "1")"
+		if [ -n "$agh_port" ] && ! port_free "$agh_port"; then
+			for pid in $(port_pids "$agh_port"); do
+				pname="$(pid_name "$pid")"
+				[ "$pname" = "dnsmasq" ] && occupant=1
+			done
+			if [ "$occupant" = "1" ]; then
+				curr_dns="$(uci -q get dhcp.@dnsmasq[0].port)"
+				if [ "$agh_port" != "53" ] && [ "$curr_dns" = "$agh_port" ]; then
+					logger -t AdGuardHome "moving dnsmasq from AGH port $agh_port to 53"
+					restart_dnsmasq_on 53 "$agh_port" || true
+				else
+					logger -t AdGuardHome "AGH port $agh_port held by dnsmasq; mode switch will handle it"
+				fi
+			else
+				logger -t AdGuardHome "freeing AGH port $agh_port from stale process"
+				free_port_force "$agh_port" "start" || true
+			fi
+		fi
+	fi
+
 	procd_open_instance
 	get_tz
 	[ -n "$SET_TZ" ] && procd_set_param env TZ="$SET_TZ"
