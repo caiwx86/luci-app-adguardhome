@@ -616,7 +616,7 @@ wait_agh_on()
 	local port="$1" timeout="$2" i=0
 	[ -z "$timeout" ] && timeout=25
 	while [ "$i" -lt "$timeout" ]; do
-		port_has_agh "$port" && return 0
+		[ -n "$(port_inodes "$port")" ] && return 0
 		sleep 1
 		i=$((i + 1))
 	done
