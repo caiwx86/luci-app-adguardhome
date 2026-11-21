@@ -1184,9 +1184,15 @@ start_service() {
 		if [ -n "$agh_port" ] && ! port_free "$agh_port"; then
 			for pid in $(port_pids "$agh_port"); do
 				pname="$(pid_name "$pid")"
-				[ "$pname" = "dnsmasq" ] && occupant=1
+				if [ "$pname" = "dnsmasq" ]; then
+					occupant=1
+				elif [ "$pname" = "AdGuardHome" ] || [ "$pname" = "$(basename "$binpath")" ]; then
+					occupant=2
+				fi
 			done
-			if [ "$occupant" = "1" ]; then
+			if [ "$occupant" = "2" ]; then
+				logger -t AdGuardHome "AGH port $agh_port held by AdGuardHome; procd will replace it"
+			elif [ "$occupant" = "1" ]; then
 				curr_dns="$(uci -q get dhcp.@dnsmasq[0].port)"
 				if [ "$agh_port" != "53" ] && [ "$curr_dns" = "$agh_port" ]; then
 					logger -t AdGuardHome "moving dnsmasq from AGH port $agh_port to 53"
